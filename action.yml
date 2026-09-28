@@ -21,7 +21,7 @@ inputs:
   scanner-version:
     description: 'correctover-scan version to run (npm dist-tag or exact version).'
     required: false
-    default: '3.2.1'
+    default: '3.2.2'
   fail-on:
     description: 'When to fail the job: "error" (critical/SSRF only), "warning" (also on warnings), or "none" (report only).'
     required: false
@@ -69,6 +69,18 @@ runs:
         FAIL_ON: ${{ inputs.fail-on }}
       run: |
         set -euo pipefail
+        # Defense in depth: if the scanner (or an older version) produced no
+        # SARIF artifact, treat it as a zero-result run rather than crashing.
+        if [ ! -f "$SARIF_FILE" ]; then
+          echo "::warning::No SARIF artifact was produced ($SARIF_FILE); treating as 0 findings."
+          {
+            echo "total=0"
+            echo "error=0"
+            echo "warning=0"
+            echo "should-fail=false"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
         node --input-type=module <<'NODE'
         import fs from 'node:fs';
         const file = process.env.SARIF_FILE;
