@@ -1,0 +1,136 @@
+name: 'Correctover Security Scan'
+description: 'Fail-closed agent/MCP runtime security gate — scans JS bundles, npm packages and MCP configs for RCE, SSRF, cloud-credential hijack and injection (OWASP AISVS), uploads SARIF, and leaves a verifiable PR evidence trail.'
+author: 'Correctover'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  target:
+    description: 'File or directory to scan. Defaults to the repository root.'
+    required: false
+    default: '.'
+  mode:
+    description: 'Scan mode: "bundle" (shipped JS / npm package), "config" (an MCP config file), or "auto" (let the CLI decide).'
+    required: false
+    default: 'bundle'
+  sarif-file:
+    description: 'Path of the SARIF report to produce and upload.'
+    required: false
+    default: 'correctover-results.sarif'
+  scanner-version:
+    description: 'correctover-scan version to run (npm dist-tag or exact version).'
+    required: false
+    default: '3.2.1'
+  fail-on:
+    description: 'When to fail the job: "error" (critical/SSRF only), "warning" (also on warnings), or "none" (report only).'
+    required: false
+    default: 'error'
+  upload-sarif:
+    description: 'Upload the SARIF file to GitHub code scanning.'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Resolve scan arguments
+      id: args
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "${{ inputs.mode }}" in
+          bundle) flag="--bundle" ;;
+          config) flag="" ;;
+          auto)   flag="" ;;
+          *) echo "::error::Unknown mode '${{ inputs.mode }}' (use bundle | config | auto)"; exit 1 ;;
+        esac
+        echo "flag=${flag}" >> "$GITHUB_OUTPUT"
+        mkdir -p "$(dirname "${{ inputs.sarif-file }}")"
+
+    - name: Run Correctover scan
+      id: scan
+      shell: bash
+      run: |
+        set -euo pipefail
+        # bundle/config mode runs without a license gate and emits SARIF with
+        # file+line locations. Diagnostics go to stderr; stdout stays clean.
+        # shellcheck disable=SC2086
+        npx --yes "correctover-scan@${{ inputs.scanner-version }}" \
+          ${{ steps.args.outputs.flag }} "${{ inputs.target }}" \
+          --format sarif --output "${{ inputs.sarif-file }}"
+        echo "scan-ok=true" >> "$GITHUB_OUTPUT"
+
+    - name: Evaluate gate result
+      id: gate
+      shell: bash
+      env:
+        SARIF_FILE: ${{ inputs.sarif-file }}
+        FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        set -euo pipefail
+        node --input-type=module <<'NODE'
+        import fs from 'node:fs';
+        const file = process.env.SARIF_FILE;
+        const policy = process.env.FAIL_ON;
+        const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+        const results = data.runs?.[0]?.results ?? [];
+        const errors = results.filter(r => r.level === 'error');
+        const warnings = results.filter(r => r.level === 'warning');
+        let fail = false;
+        if (policy === 'error' && errors.length) fail = true;
+        if (policy === 'warning' && (errors.length || warnings.length)) fail = true;
+        // Write key=value lines to a known file; sourced into $GITHUB_OUTPUT below.
+        fs.writeFileSync('correctover-gate.env',
+          `total=${results.length}\nerror=${errors.length}\nwarning=${warnings.length}\nshould-fail=${fail}\n`);
+        console.log(`Correctover: ${results.length} finding(s) — ${errors.length} error, ${warnings.length} warning (fail-on=${policy})`);
+        NODE
+        # Expose the values to later steps in this composite action.
+        {
+          echo "total=$(awk -F= '$1=="total"{print $2}' correctover-gate.env)"
+          echo "error=$(awk -F= '$1=="error"{print $2}' correctover-gate.env)"
+          echo "warning=$(awk -F= '$1=="warning"{print $2}' correctover-gate.env)"
+          echo "should-fail=$(awk -F= '$1=="should-fail"{print $2}' correctover-gate.env)"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Add result to job summary
+      shell: bash
+      env:
+        SHOULD_FAIL: ${{ steps.gate.outputs.should-fail }}
+        N_ERROR: ${{ steps.gate.outputs.error }}
+        N_WARNING: ${{ steps.gate.outputs.warning }}
+        N_TOTAL: ${{ steps.gate.outputs.total }}
+      run: |
+        set -euo pipefail
+        {
+          echo "## Correctover security scan"
+          echo
+          if [ "${SHOULD_FAIL}" = "true" ]; then
+            echo "**:rotating_light: Gate failed** — blocking findings detected by an independent, fail-closed runtime verification layer."
+          else
+            echo "**:shield: Gate passed** — no blocking findings at the configured threshold."
+          fi
+          echo
+          echo "| Critical/error | Warning | Total |"
+          echo "| ---: | ---: | ---: |"
+          echo "| ${N_ERROR} | ${N_WARNING} | ${N_TOTAL} |"
+          echo
+          echo "Static signal scan over the current snapshot — it does **not** prove the absence of reachable vulnerabilities and is not an audit or certification."
+          echo "Need an **official signed compliance report** for vendor acceptance, or a 116-check manual deep audit (no critical issue found → you pay nothing)? See [Correctover](https://dshcorrectover.github.io/agent-audit/)."
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload SARIF to code scanning
+      if: inputs.upload-sarif == 'true'
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ inputs.sarif-file }}
+
+    - name: Fail the job
+      if: steps.gate.outputs.should-fail == 'true'
+      shell: bash
+      env:
+        N_ERROR: ${{ steps.gate.outputs.error }}
+        N_WARNING: ${{ steps.gate.outputs.warning }}
+      run: |
+        echo "::error::Correctover gate failed: ${N_ERROR} error / ${N_WARNING} warning. See the SARIF results and job summary."
+        exit 1
